@@ -2,7 +2,7 @@
 //  FUSION - THE BODY
 //  Joins WiFi, FINDS THE LAPTOP BY ITSELF, asks the backend for the finger
 //  count 5 times a second, and lights that many LEDs. Ticks the buzzer when a
-//  light comes on. Flashes all LEDs when SOS is on (peace sign for 1 s).
+//  light comes on. Flashes all LEDs when SOS is on (hold the rock sign for 2 s).
 //
 //  No laptop IP to type: the board searches the network for the backend's
 //  /health answer and remembers the address. If the laptop's IP changes, it
@@ -25,7 +25,7 @@ const char* WIFI_PASSWORD = "isimbii";  // capitals matter, must be 8+ character
 
 // Hosted backend: e.g. "https://fusion-backend-xxxx.onrender.com/fingers"
 // Leave "" to search the local WiFi for the laptop instead.
-const char* BACKEND_URL   = "";
+const char* BACKEND_URL   = "https://fusion-backend-q7qa.onrender.com/fingers";
 // ----------------------------------------------------------------------------
 
 const int BACKEND_PORT = 8000;
@@ -93,7 +93,7 @@ void scanNetworks() {
 
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);  // gentler on weak USB power
+  if (strlen(BACKEND_URL) == 0) WiFi.setTxPower(WIFI_POWER_8_5dBm);  // gentler on weak USB power
 
   if (strlen(WIFI_PASSWORD) > 0 && strlen(WIFI_PASSWORD) < 8) {
     Serial.printf("WARNING: password \"%s\" is %d characters. WiFi passwords are at "
@@ -246,12 +246,49 @@ void setup() {
     secureClient.setInsecure();  // accept the host's certificate without pinning it
     Serial.print("Using hosted backend: ");
     Serial.println(backendUrl);
+    if (!backendUrl.endsWith("/fingers")) Serial.println("WARNING: URL should end with /fingers");
   } else {
     findBackend();
   }
 }
 
 bool hosted() { return strlen(BACKEND_URL) > 0; }
+
+// When the hosted backend can't be reached, test each step separately and say which fails.
+void diagnoseHosted() {
+  String host = backendUrl.substring(backendUrl.indexOf("://") + 3);
+  host = host.substring(0, host.indexOf('/'));
+  Serial.println("---- diagnosing connection to " + host + " ----");
+
+  IPAddress ip;
+  if (!WiFi.hostByName(host.c_str(), ip)) {
+    Serial.println("1. Name lookup (DNS): FAILED -> the hotspot gives no internet/DNS.");
+    Serial.println("   Turn ON mobile data on the phone sharing the hotspot.");
+    return;
+  }
+  Serial.println("1. Name lookup (DNS): ok -> " + ip.toString());
+
+  WiFiClient plain;
+  if (!plain.connect(host.c_str(), 80, 5000)) {
+    Serial.println("2. Internet (port 80): FAILED -> hotspot has no working internet.");
+    return;
+  }
+  plain.stop();
+  Serial.println("2. Internet (port 80): ok");
+
+  WiFiClientSecure probe;
+  probe.setInsecure();
+  probe.setHandshakeTimeout(30);
+  if (!probe.connect(host.c_str(), 443)) {
+    char err[120];
+    probe.lastError(err, sizeof(err));
+    Serial.printf("3. Secure handshake (443): FAILED -> %s\n", err);
+    Serial.printf("   Free memory: %u bytes (needs ~45000)\n", ESP.getFreeHeap());
+    return;
+  }
+  probe.stop();
+  Serial.println("3. Secure handshake (443): ok -> the connection works; retrying normally.");
+}
 
 void loop() {
   readSerialCommand();
@@ -306,7 +343,12 @@ void loop() {
   } else {
     // -1 = laptop not found (IP changed / different network / backend stopped)
     // 404 = wrong path (should end in /fingers)
-    Serial.printf("backend error %d\n", code);
+    Serial.printf("backend error %d (%s)\n", code, http.errorToString(code).c_str());
+    if (code < 0 && backendUrl.startsWith("https")) {
+      secureClient.stop();  // drop the dead connection; the next poll opens a fresh one
+      static bool diagnosed = false;
+      if (!diagnosed) { diagnosed = true; diagnoseHosted(); }
+    }
     if (++errorsInARow >= ERRORS_UNTIL_OFF) {
       setAll(false);  // don't leave stale lights on
       shownCount = -1;
